@@ -1,5 +1,17 @@
-#!/usr/bin/env dotnet
-#:package Spectre.Console@*
+#!/usr/bin/env -S dotnet --
+#:property TargetFramework=net10.0
+#:property PackAsTool=true
+#:property ToolCommandName=claude-usage
+#:property PackageId=ClaudeUsage
+#:property Authors=nockawa
+#:property Description=Terminal dashboard for your Claude subscription usage — session/weekly windows, per-model burn-rate pace, extra-usage spend, and live service status.
+#:property PackageTags=claude;anthropic;usage;cli;tui;dashboard;dotnet-tool;spectre-console
+#:property PackageProjectUrl=https://github.com/nockawa/ClaudeUsage
+#:property RepositoryUrl=https://github.com/nockawa/ClaudeUsage.git
+#:property RepositoryType=git
+#:property PackageLicenseExpression=Unlicense
+#:property PublishAot=false
+#:package Spectre.Console@0.57.0
 
 using System.Diagnostics;
 using System.Globalization;
@@ -807,9 +819,9 @@ static Panel BuildWindowPanel(string title, WindowStats? w, TimeSpan windowDurat
     var elapsedPct = Math.Clamp(elapsed.TotalSeconds / windowDuration.TotalSeconds * 100, 0, 100);
     var delta = w.UtilPct - elapsedPct;
     var (color, icon, word) =
-        delta >  5 ? ("red",    "🔴", "AHEAD")  :
-        delta < -5 ? ("green",  "🟢", "BEHIND") :
-                     ("yellow", "🟡", "ON PACE");
+        delta >  5 ? ("red",    "●", "AHEAD")  :
+        delta < -5 ? ("green",  "●", "BEHIND") :
+                     ("yellow", "●", "ON PACE");
 
     var grid = new Grid()
         .AddColumn(new GridColumn().NoWrap())
