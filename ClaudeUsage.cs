@@ -19,6 +19,11 @@ using System.Text.Json;
 using Spectre.Console;
 using Spectre.Console.Rendering;
 
+// Force UTF-8 so box-drawing and status markers render on consoles whose
+// default code page isn't UTF-8 (notably Windows). Guarded: throws if output
+// is redirected with no attached console.
+try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { /* redirected / no console */ }
+
 var refreshMinutes = 15;
 var once = false;
 var dump = false;
