@@ -1,0 +1,21 @@
+# Build output
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+*.user
+
+# .NET file-based app artifacts
+artifacts/
+
+# IDE
+.idea/
+.vs/
+.vscode/
+
+# Local agent/tooling state
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
