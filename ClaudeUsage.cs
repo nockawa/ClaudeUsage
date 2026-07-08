@@ -1,6 +1,19 @@
-#!/usr/bin/env dotnet
-#:package Spectre.Console@*
+#!/usr/bin/env -S dotnet --
+#:property TargetFramework=net10.0
+#:property PackAsTool=true
+#:property ToolCommandName=claude-usage
+#:property PackageId=ClaudeUsage
+#:property Authors=nockawa
+#:property Description=Terminal dashboard for your Claude subscription usage — session/weekly windows, per-model burn-rate pace, extra-usage spend, and live service status.
+#:property PackageTags=claude;anthropic;usage;cli;tui;dashboard;dotnet-tool;spectre-console
+#:property PackageProjectUrl=https://github.com/nockawa/ClaudeUsage
+#:property RepositoryUrl=https://github.com/nockawa/ClaudeUsage.git
+#:property RepositoryType=git
+#:property PackageLicenseExpression=Unlicense
+#:property PublishAot=false
+#:package Spectre.Console@0.57.0
 
+using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
 using Spectre.Console;
@@ -35,12 +48,9 @@ var credPath = Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
     ".claude", ".credentials.json");
 
-if (!File.Exists(credPath))
-{
-    AnsiConsole.MarkupLine($"[red]❌ Credentials not found at:[/] {Markup.Escape(credPath)}");
-    AnsiConsole.MarkupLine("Run [yellow]claude login[/] first.");
-    return 1;
-}
+// macOS stores the Claude CLI credentials as a login-Keychain generic password
+// under this service name instead of the .credentials.json file.
+const string KeychainService = "Claude Code-credentials";
 
 string token = "";
 DateTime credLastWriteUtc = DateTime.MinValue;
@@ -48,8 +58,12 @@ HttpClient client = MakeClient();
 
 if (!await ReloadToken(force: true))
 {
-    AnsiConsole.MarkupLine($"[red]❌ Could not read credentials at:[/] {Markup.Escape(credPath)}");
-    AnsiConsole.MarkupLine("Run [yellow]claude login[/] first.");
+    AnsiConsole.MarkupLine("[red]❌ Could not read Claude credentials.[/]");
+    if (OperatingSystem.IsMacOS())
+        AnsiConsole.MarkupLine($"Looked in the login Keychain ([yellow]{KeychainService}[/]) and at {Markup.Escape(credPath)}.");
+    else
+        AnsiConsole.MarkupLine($"Looked at {Markup.Escape(credPath)}.");
+    AnsiConsole.MarkupLine("Run [yellow]claude login[/] first, or set [yellow]CLAUDE_CODE_OAUTH_TOKEN[/].");
     return 1;
 }
 
@@ -324,10 +338,25 @@ async Task<bool> ReloadToken(bool force)
 {
     try
     {
-        var credJson = await File.ReadAllTextAsync(credPath);
-        credLastWriteUtc = File.GetLastWriteTimeUtc(credPath);
-        using var doc = JsonDocument.Parse(credJson);
-        var newToken = doc.RootElement.GetProperty("claudeAiOauth").GetProperty("accessToken").GetString();
+        // Source priority: the CLAUDE_CODE_OAUTH_TOKEN env var carries the bearer
+        // token directly (useful over SSH / headless where the Keychain is locked);
+        // otherwise fall back to the local Claude CLI credentials store.
+        string? newToken;
+        var envToken = Environment.GetEnvironmentVariable("CLAUDE_CODE_OAUTH_TOKEN");
+        if (!string.IsNullOrWhiteSpace(envToken))
+        {
+            newToken = envToken.Trim();
+            credLastWriteUtc = DateTime.MinValue;   // no file to watch for rotation
+        }
+        else
+        {
+            var blob = await ReadCredentialBlobAsync();
+            if (blob is null) return false;
+            using var doc = JsonDocument.Parse(blob);
+            newToken = doc.RootElement.GetProperty("claudeAiOauth").GetProperty("accessToken").GetString();
+            // Only the file source has a cheap change signal; MinValue means "always re-read".
+            credLastWriteUtc = File.Exists(credPath) ? File.GetLastWriteTimeUtc(credPath) : DateTime.MinValue;
+        }
         if (string.IsNullOrEmpty(newToken)) return false;
         if (!force && newToken == token) return false;
         token = newToken;
@@ -342,11 +371,50 @@ async Task<bool> ReloadIfChanged()
 {
     try
     {
-        var lw = File.GetLastWriteTimeUtc(credPath);
-        if (lw == credLastWriteUtc) return false;
+        // File source: skip the reload unless the file's mtime moved. Env var and
+        // Keychain have no cheap change signal (credLastWriteUtc == MinValue), so
+        // fall through and re-read — both are cheap on the refresh cadence.
+        if (credLastWriteUtc != DateTime.MinValue && File.Exists(credPath)
+            && File.GetLastWriteTimeUtc(credPath) == credLastWriteUtc)
+            return false;
         return await ReloadToken(force: false);
     }
     catch { return false; }
+}
+
+// Read the raw credentials JSON blob from the local Claude CLI store.
+// Windows/Linux: the ~/.claude/.credentials.json file.
+// macOS: the same file if present, otherwise the login Keychain.
+async Task<string?> ReadCredentialBlobAsync()
+{
+    if (File.Exists(credPath))
+        return await File.ReadAllTextAsync(credPath);
+    if (OperatingSystem.IsMacOS())
+        return await ReadMacKeychainAsync(KeychainService);
+    return null;
+}
+
+// Shell out to the macOS `security` CLI to fetch the credentials blob. `-w` prints
+// only the password (the JSON). May trigger a one-time Keychain access prompt.
+static async Task<string?> ReadMacKeychainAsync(string service)
+{
+    try
+    {
+        var psi = new ProcessStartInfo("/usr/bin/security")
+        {
+            ArgumentList           = { "find-generic-password", "-s", service, "-w" },
+            RedirectStandardOutput = true,
+            RedirectStandardError  = true,
+            UseShellExecute        = false,
+        };
+        using var p = Process.Start(psi);
+        if (p is null) return null;
+        var outTask = p.StandardOutput.ReadToEndAsync();
+        await p.WaitForExitAsync();
+        var outp = (await outTask).Trim();
+        return p.ExitCode == 0 && outp.Length > 0 ? outp : null;
+    }
+    catch { return null; }
 }
 
 HttpClient MakeClient()
@@ -751,9 +819,9 @@ static Panel BuildWindowPanel(string title, WindowStats? w, TimeSpan windowDurat
     var elapsedPct = Math.Clamp(elapsed.TotalSeconds / windowDuration.TotalSeconds * 100, 0, 100);
     var delta = w.UtilPct - elapsedPct;
     var (color, icon, word) =
-        delta >  5 ? ("red",    "🔴", "AHEAD")  :
-        delta < -5 ? ("green",  "🟢", "BEHIND") :
-                     ("yellow", "🟡", "ON PACE");
+        delta >  5 ? ("red",    "●", "AHEAD")  :
+        delta < -5 ? ("green",  "●", "BEHIND") :
+                     ("yellow", "●", "ON PACE");
 
     var grid = new Grid()
         .AddColumn(new GridColumn().NoWrap())
