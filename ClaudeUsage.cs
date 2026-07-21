@@ -166,7 +166,7 @@ if (once)
         var msg = $"{label}: {ex.Message}";
         snap = cached is not null
             ? cached with { Error = msg }
-            : new UsageSnapshot(null, null, null, null, null, now, msg);
+            : new UsageSnapshot(null, null, Array.Empty<ModelUsage>(), null, now, msg);
     }
 
     var profile = await TryFetchJson("https://api.anthropic.com/api/oauth/profile", ProfileInfo.From);
@@ -187,7 +187,7 @@ var model = new ModelHolder();
 // round-trip. NextAttemptAt = now makes the fetcher refresh right away.
 {
     var now = DateTimeOffset.UtcNow;
-    var seed = TryLoadCache() ?? new UsageSnapshot(null, null, null, null, null, now, null);
+    var seed = TryLoadCache() ?? new UsageSnapshot(null, null, Array.Empty<ModelUsage>(), null, now, null);
     model.Set(new ViewModel(seed, null, rateLimit, now, 0, ComputeTrends(history, seed, now)));
 }
 
@@ -549,10 +549,13 @@ static void RecordHistory(HistoryStore s, UsageSnapshot snap)
 {
     AppendHistory(s, "session", snap.Session, snap.FetchedAt);
     AppendHistory(s, "weekly",  snap.Weekly,  snap.FetchedAt);
-    AppendHistory(s, "sonnet",  snap.Sonnet,  snap.FetchedAt);
-    AppendHistory(s, "opus",    snap.Opus,    snap.FetchedAt);
+    foreach (var m in snap.Models)
+        if (m.Percent is { } pct && m.ResetsAt is { } resets)
+            AppendHistory(s, ModelSeries(m.Model), new WindowStats(pct, resets), snap.FetchedAt);
     SaveHistory(s);
 }
+
+static string ModelSeries(string model) => "model:" + model;
 
 static void AppendHistory(HistoryStore s, string key, WindowStats? w, DateTimeOffset at)
 {
@@ -570,11 +573,20 @@ static void AppendHistory(HistoryStore s, string key, WindowStats? w, DateTimeOf
 static bool SameWindow(DateTimeOffset a, DateTimeOffset b) =>
     Math.Abs((a - b).TotalMinutes) < 10;
 
-static TrendSet ComputeTrends(HistoryStore s, UsageSnapshot snap, DateTimeOffset now) => new(
-    Session: ComputeTrend(s, "session", snap.Session, now, TimeSpan.FromMinutes(45)),
-    Weekly:  ComputeTrend(s, "weekly",  snap.Weekly,  now, TimeSpan.FromHours(3)),
-    Sonnet:  ComputeTrend(s, "sonnet",  snap.Sonnet,  now, TimeSpan.FromHours(3)),
-    Opus:    ComputeTrend(s, "opus",    snap.Opus,    now, TimeSpan.FromHours(3)));
+static TrendSet ComputeTrends(HistoryStore s, UsageSnapshot snap, DateTimeOffset now)
+{
+    var models = new Dictionary<string, Trend?>();
+    foreach (var m in snap.Models)
+    {
+        if (m.Percent is not { } pct || m.ResetsAt is not { } resets) continue; // no data → no trend
+        models[m.Model] = ComputeTrend(s, ModelSeries(m.Model),
+            new WindowStats(pct, resets), now, TimeSpan.FromHours(3));
+    }
+    return new TrendSet(
+        ComputeTrend(s, "session", snap.Session, now, TimeSpan.FromMinutes(45)),
+        ComputeTrend(s, "weekly",  snap.Weekly,  now, TimeSpan.FromHours(3)),
+        models);
+}
 
 static Trend? ComputeTrend(HistoryStore s, string key, WindowStats? w, DateTimeOffset now, TimeSpan lookback)
 {
@@ -695,11 +707,32 @@ static ClaudeStatus ParseStatus(JsonElement root)
         break; // show only the most recent active incident
     }
 
+    // Soonest upcoming or in-progress maintenance window (completed ones skipped).
+    StatusMaintenance? maintenance = null;
+    if (root.TryGetProperty("scheduled_maintenances", out var maints) && maints.ValueKind == JsonValueKind.Array)
+        foreach (var m in maints.EnumerateArray())
+        {
+            var st = m.TryGetProperty("status", out var stEl) ? stEl.GetString() : null;
+            if (st is null or "completed") continue;
+            var forT   = ParseDto(m, "scheduled_for");
+            var untilT = ParseDto(m, "scheduled_until");
+            var cand = new StatusMaintenance(
+                m.GetProperty("name").GetString()!, st!, forT, untilT,
+                m.TryGetProperty("impact", out var im) ? im.GetString() ?? "" : "");
+            if (maintenance is null
+                || (forT is { } f && (maintenance.ScheduledFor is not { } mf || f < mf)))
+                maintenance = cand;
+        }
+
     var pageUpdatedAt = DateTimeOffset.Parse(
         root.GetProperty("page").GetProperty("updated_at").GetString()!,
         CultureInfo.InvariantCulture);
 
-    return new ClaudeStatus(indicator, description, components, incident, pageUpdatedAt, DateTimeOffset.UtcNow);
+    return new ClaudeStatus(indicator, description, components, incident, maintenance, pageUpdatedAt, DateTimeOffset.UtcNow);
+
+    static DateTimeOffset? ParseDto(JsonElement el, string prop) =>
+        el.TryGetProperty(prop, out var p) && p.ValueKind == JsonValueKind.String
+            ? DateTimeOffset.Parse(p.GetString()!, CultureInfo.InvariantCulture) : null;
 }
 
 static IRenderable BuildView(ViewModel vm, ClaudeStatus? claudeStatus, DateTimeOffset now, TimeSpan refreshInterval, bool liveMode)
@@ -719,7 +752,7 @@ static IRenderable BuildView(ViewModel vm, ClaudeStatus? claudeStatus, DateTimeO
 
     var leftCol = new Rows(
         BuildWindowPanel("🕐 Session (5h)", snap.Session, TimeSpan.FromHours(5), now, showPace: false, trends.Session),
-        BuildModelPanel(snap, trends.Sonnet, trends.Opus)
+        BuildModelPanel(snap, trends)
     );
 
     var rightCol = new Rows(
@@ -771,8 +804,10 @@ static IRenderable BuildStatusRow(ClaudeStatus? status, DateTimeOffset now)
     if (status is null)
         return new Markup("[grey]  ○ status.claude.com …[/]");
 
+    var maint = FormatMaintenance(status.NextMaintenance, now);
+
     if (status.Indicator == "none")
-        return new Markup("[green]  ● All systems operational[/]  [grey]status.claude.com[/]");
+        return new Markup("[green]  ● All systems operational[/]  [grey]status.claude.com[/]" + maint);
 
     var (color, dot) = status.Indicator switch
     {
@@ -808,11 +843,26 @@ static IRenderable BuildStatusRow(ClaudeStatus? status, DateTimeOffset now)
         sb.Append($"  [grey]·[/]  [bold]{Markup.Escape(inc.Name)}[/] [{color}]{inc.IncidentStatus}[/] [grey]{elapsed} ago[/]");
     }
 
+    sb.Append(maint);
+
     return new Panel(new Markup(sb.ToString()))
         .Header($" [{color}]{dot}[/] [bold]Status Update[/] ", Justify.Left)
         .Border(BoxBorder.Rounded)
         .BorderColor(Color.Grey39)
         .Expand();
+}
+
+static string FormatMaintenance(StatusMaintenance? m, DateTimeOffset now)
+{
+    if (m is null) return "";
+    string when;
+    if (m.Status is "in_progress" or "verifying")
+        when = m.ScheduledUntil is { } u && u > now ? $"in progress · ends in {FormatDuration(u - now)}" : "in progress";
+    else if (m.ScheduledFor is { } f)
+        when = f > now ? $"in {FormatDuration(f - now)}" : "imminent";
+    else
+        when = Markup.Escape(m.Status);
+    return $"  [grey]·[/]  [blue]🔧 {Markup.Escape(m.Name)}[/] [grey]{when}[/]";
 }
 
 static Panel BuildWindowPanel(string title, WindowStats? w, TimeSpan windowDuration, DateTimeOffset now, bool showPace, Trend? trend)
@@ -833,7 +883,7 @@ static Panel BuildWindowPanel(string title, WindowStats? w, TimeSpan windowDurat
         .AddColumn(new GridColumn().PadLeft(2));
 
     var trendStr = FormatTrend(trend);
-    grid.AddRow("[bold]Used[/]",    Bar(w.UtilPct, color)    + $"  {w.UtilPct:F1}%{trendStr}");
+    grid.AddRow("[bold]Used[/]",    Bar(w.UtilPct, color)    + $"  {w.UtilPct:F1}%{trendStr}" + SeverityBadge(w.Severity));
     grid.AddRow("[bold]Elapsed[/]", Bar(elapsedPct, "grey")  + $"  {elapsedPct:F1}%");
     grid.AddEmptyRow();
     grid.AddRow($"[{color}]{icon} {word}[/]", $"by [{color}]{Math.Abs(delta):F1}%[/]");
@@ -854,20 +904,35 @@ static Panel BuildWindowPanel(string title, WindowStats? w, TimeSpan windowDurat
     return Wrap(title, grid);
 }
 
-static Panel BuildModelPanel(UsageSnapshot snap, Trend? sonnet, Trend? opus)
+static Panel BuildModelPanel(UsageSnapshot snap, TrendSet trends)
 {
     var grid = new Grid()
         .AddColumn(new GridColumn().NoWrap())
         .AddColumn(new GridColumn().PadLeft(2));
-    AddModelRow(grid, "Sonnet", snap.Sonnet, "blue",    sonnet);
-    AddModelRow(grid, "Opus",   snap.Opus,   "magenta", opus);
-    return Wrap("Per-Model (7d)", grid);
 
-    static void AddModelRow(Grid g, string name, WindowStats? w, string color, Trend? trend)
+    if (snap.Models.Count == 0)
     {
-        if (w is null) g.AddRow($"[bold]{name}[/]", "[grey]n/a[/]");
-        else g.AddRow($"[bold]{name}[/]", Bar(w.UtilPct, color) + $"  {w.UtilPct:F1}%" + FormatTrendShort(trend));
+        grid.AddRow("[grey]no per-model limits[/]", "");
+        return Wrap("Per-Model (7d)", grid);
     }
+
+    // Scoped models (from `limits`, e.g. Fable) come first, then legacy Opus/Sonnet.
+    // A null percent means the API returns no figure for that model right now → n/a.
+    var palette = new[] { "magenta", "blue", "cyan", "green", "yellow" };
+    var i = 0;
+    foreach (var m in snap.Models)
+    {
+        var color = palette[i++ % palette.Length];
+        if (m.Percent is not { } pct)
+        {
+            grid.AddRow($"[bold]{Markup.Escape(m.Model)}[/]", "[grey]n/a[/]");
+            continue;
+        }
+        trends.Models.TryGetValue(m.Model, out var trend);
+        grid.AddRow($"[bold]{Markup.Escape(m.Model)}[/]",
+                    Bar(pct, color) + $"  {pct:F1}%" + FormatTrendShort(trend) + SeverityBadge(m.Severity));
+    }
+    return Wrap("Per-Model (7d)", grid);
 }
 
 static string FormatTrend(Trend? t)
@@ -877,6 +942,16 @@ static string FormatTrend(Trend? t)
 }
 
 static string FormatTrendShort(Trend? t) => t is null ? "" : $"  {t.Arrow()}";
+
+// API severity → a compact ⚠ badge. "normal"/null renders nothing, so the signal
+// only appears when the API flags a window/model/overage as nearing its cap.
+static string SeverityBadge(string? sev)
+{
+    if (string.IsNullOrWhiteSpace(sev) || sev.Equals("normal", StringComparison.OrdinalIgnoreCase)) return "";
+    var s = sev.ToLowerInvariant();
+    var color = s.Contains("crit") || s.Contains("exceed") || s.Contains("reach") || s.Contains("major") ? "red" : "yellow";
+    return $"  [bold {color}]⚠ {Markup.Escape(sev.ToUpperInvariant())}[/]";
+}
 
 static Panel BuildExtraPanel(ExtraUsage? extra)
 {
@@ -900,7 +975,7 @@ static Panel BuildExtraPanel(ExtraUsage? extra)
     grid.AddRow("[bold]Used[/]",   $"{sym}{extra.UsedCredits:F2}");
     grid.AddRow("[bold]Limit[/]",  $"{sym}{extra.MonthlyLimit:F0}");
     var pct = extra.Utilization ?? (extra.MonthlyLimit > 0 ? (double)(extra.UsedCredits / extra.MonthlyLimit) * 100 : 0);
-    grid.AddRow("[bold]Util[/]",   Bar(pct, "yellow") + $"  {pct:F1}%");
+    grid.AddRow("[bold]Util[/]",   Bar(pct, "yellow") + $"  {pct:F1}%" + SeverityBadge(extra.Severity));
 
     return Wrap("Extra Usage", grid);
 }
@@ -969,7 +1044,10 @@ record ProfileInfo(string? Display, string? Plan)
         var plan  = TryStr(root, "subscription", "type")
                  ?? TryStr(root, "subscription", "tier")
                  ?? TryStr(root, "subscriptionType")
-                 ?? TryStr(root, "plan_tier");
+                 ?? TryStr(root, "plan_tier")
+                 // rate_limit_tier ("default_claude_max_20x") is the reliable multiplier
+                 // source — the profile endpoint doesn't return has_claude_max_20x.
+                 ?? PlanFromTier(TryStr(root, "organization", "rate_limit_tier"));
 
         if (plan is null)
         {
@@ -980,6 +1058,23 @@ record ProfileInfo(string? Display, string? Plan)
         }
 
         return new ProfileInfo(name ?? email, plan);
+    }
+
+    // Maps rate_limit_tier ("default_claude_max_20x" / "…max_5x") to a friendly label,
+    // pulling out the usage multiplier when present.
+    static string? PlanFromTier(string? tier)
+    {
+        if (string.IsNullOrEmpty(tier)) return null;
+        var t = tier.ToLowerInvariant();
+        if (t.Contains("max"))
+        {
+            var m = System.Text.RegularExpressions.Regex.Match(t, @"max[_-]?(\d+)x");
+            return m.Success ? $"Max {m.Groups[1].Value}x" : "Max";
+        }
+        if (t.Contains("team")) return "Team";
+        if (t.Contains("pro"))  return "Pro";
+        if (t.Contains("free")) return "Free";
+        return null;
     }
 
     static string? TryStr(JsonElement root, params string[] path)
@@ -1010,19 +1105,37 @@ record ProfileInfo(string? Display, string? Plan)
     }
 }
 
-record WindowStats(double UtilPct, DateTimeOffset ResetsAt);
+record WindowStats(double UtilPct, DateTimeOffset ResetsAt)
+{
+    // API-reported proximity to the cap ("normal" until a window nears its limit).
+    public string? Severity { get; init; }
+}
 
-record ExtraUsage(bool Enabled, decimal MonthlyLimit, decimal UsedCredits, double? Utilization, string Currency);
+// A per-model weekly figure for the "Per-Model" panel. `Percent` is null when the
+// API reports no data for that model (the deprecated top-level seven_day_* keys now
+// return null); the row still renders as n/a so the model stays listed. `ResetsAt`
+// populates once usage accrues, at which point trends can be computed.
+record ModelUsage(string Model, double? Percent, DateTimeOffset? ResetsAt, bool IsActive, string? Severity);
+
+record ExtraUsage(bool Enabled, decimal MonthlyLimit, decimal UsedCredits, double? Utilization, string Currency, string? Severity);
 
 record ClaudeStatus(
     string Indicator,
     string Description,
     StatusComponent[] Components,
     StatusIncident? ActiveIncident,
+    StatusMaintenance? NextMaintenance,
     DateTimeOffset PageUpdatedAt,
     DateTimeOffset FetchedAt);
 
 record StatusComponent(string Name, string Status);
+
+record StatusMaintenance(
+    string Name,
+    string Status,
+    DateTimeOffset? ScheduledFor,
+    DateTimeOffset? ScheduledUntil,
+    string Impact);
 
 record StatusIncident(
     string Name,
@@ -1043,7 +1156,7 @@ class HistorySample
     public DateTimeOffset ResetsAt { get; set; }
 }
 
-record TrendSet(Trend? Session, Trend? Weekly, Trend? Sonnet, Trend? Opus);
+record TrendSet(Trend? Session, Trend? Weekly, IReadOnlyDictionary<string, Trend?> Models);
 
 // Immutable snapshot of everything the view needs. The fetcher builds a new one per
 // attempt and swaps it into ModelHolder; the renderer always sees a consistent set.
@@ -1086,39 +1199,109 @@ record Trend(double ObservedRatePctPerHour, double TargetRatePctPerHour, int Buc
 record UsageSnapshot(
     WindowStats? Session,
     WindowStats? Weekly,
-    WindowStats? Sonnet,
-    WindowStats? Opus,
+    IReadOnlyList<ModelUsage> Models,
     ExtraUsage? Extra,
     DateTimeOffset FetchedAt,
     string? Error)
 {
     public static UsageSnapshot From(JsonElement root) => new(
-        ParseWindow(root, "five_hour"),
-        ParseWindow(root, "seven_day"),
-        ParseWindow(root, "seven_day_sonnet"),
-        ParseWindow(root, "seven_day_opus"),
+        ParseWindow(root, "five_hour", SeverityByKind(root, "session")),
+        ParseWindow(root, "seven_day", SeverityByKind(root, "weekly_all")),
+        ParseModels(root),
         ParseExtra(root),
         DateTimeOffset.UtcNow,
         null);
 
-    static WindowStats? ParseWindow(JsonElement root, string name)
+    static WindowStats? ParseWindow(JsonElement root, string name, string? severity)
     {
         if (!root.TryGetProperty(name, out var el) || el.ValueKind == JsonValueKind.Null) return null;
         var util = el.GetProperty("utilization").GetDouble();
         var resetsProp = el.GetProperty("resets_at");
         if (resetsProp.ValueKind == JsonValueKind.Null) return null;
-        return new WindowStats(util, DateTimeOffset.Parse(resetsProp.GetString()!, CultureInfo.InvariantCulture));
+        return new WindowStats(util, DateTimeOffset.Parse(resetsProp.GetString()!, CultureInfo.InvariantCulture))
+            { Severity = severity };
+    }
+
+    // A window's severity lives on its matching `limits` entry (session / weekly_all),
+    // not on the top-level five_hour/seven_day objects.
+    static string? SeverityByKind(JsonElement root, string kind)
+    {
+        if (!root.TryGetProperty("limits", out var limits) || limits.ValueKind != JsonValueKind.Array) return null;
+        foreach (var lim in limits.EnumerateArray())
+        {
+            if (lim.ValueKind != JsonValueKind.Object) continue;
+            if (!lim.TryGetProperty("kind", out var k) || k.GetString() != kind) continue;
+            return lim.TryGetProperty("severity", out var s) && s.ValueKind == JsonValueKind.String ? s.GetString() : null;
+        }
+        return null;
+    }
+
+    // Models shown in the "Per-Model" panel come from two sources, merged:
+    //   1. Scoped weekly caps in the `limits` array (scope.model.display_name) — the
+    //      newer mechanism; currently just Fable.
+    //   2. The legacy top-level seven_day_{opus,sonnet} keys — now returning null,
+    //      but kept so Opus/Sonnet stay listed (as n/a) and re-light if repopulated.
+    static IReadOnlyList<ModelUsage> ParseModels(JsonElement root)
+    {
+        var list = new List<ModelUsage>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        if (root.TryGetProperty("limits", out var limits) && limits.ValueKind == JsonValueKind.Array)
+            foreach (var lim in limits.EnumerateArray())
+            {
+                if (lim.ValueKind != JsonValueKind.Object) continue;
+                if (!lim.TryGetProperty("scope", out var scope) || scope.ValueKind != JsonValueKind.Object) continue;
+                if (!scope.TryGetProperty("model", out var model) || model.ValueKind != JsonValueKind.Object) continue;
+                if (!model.TryGetProperty("display_name", out var dn) || dn.ValueKind != JsonValueKind.String) continue;
+                var name = dn.GetString();
+                if (string.IsNullOrEmpty(name) || !seen.Add(name!)) continue;
+
+                double? percent = lim.TryGetProperty("percent", out var p) && p.ValueKind == JsonValueKind.Number
+                    ? p.GetDouble() : null;
+                DateTimeOffset? resets = lim.TryGetProperty("resets_at", out var r) && r.ValueKind == JsonValueKind.String
+                    ? DateTimeOffset.Parse(r.GetString()!, CultureInfo.InvariantCulture) : null;
+                var active = lim.TryGetProperty("is_active", out var ia) && ia.ValueKind == JsonValueKind.True;
+                var severity = lim.TryGetProperty("severity", out var sev) && sev.ValueKind == JsonValueKind.String
+                    ? sev.GetString() : null;
+
+                list.Add(new ModelUsage(name!, percent, resets, active, severity));
+            }
+
+        AddTopLevel("seven_day_opus",   "Opus");
+        AddTopLevel("seven_day_sonnet", "Sonnet");
+        return list;
+
+        void AddTopLevel(string key, string name)
+        {
+            if (!seen.Add(name)) return; // already present as a scoped entry
+            double? percent = null;
+            DateTimeOffset? resets = null;
+            if (root.TryGetProperty(key, out var el) && el.ValueKind == JsonValueKind.Object)
+            {
+                if (el.TryGetProperty("utilization", out var u) && u.ValueKind == JsonValueKind.Number)
+                    percent = u.GetDouble();
+                if (el.TryGetProperty("resets_at", out var rr) && rr.ValueKind == JsonValueKind.String)
+                    resets = DateTimeOffset.Parse(rr.GetString()!, CultureInfo.InvariantCulture);
+            }
+            list.Add(new ModelUsage(name, percent, resets, false, null));
+        }
     }
 
     static ExtraUsage? ParseExtra(JsonElement root)
     {
         if (!root.TryGetProperty("extra_usage", out var el) || el.ValueKind == JsonValueKind.Null) return null;
         var utilEl = el.GetProperty("utilization");
+        // Overage severity is reported on the sibling `spend` object, not `extra_usage`.
+        string? severity = null;
+        if (root.TryGetProperty("spend", out var spend) && spend.ValueKind == JsonValueKind.Object
+            && spend.TryGetProperty("severity", out var sev) && sev.ValueKind == JsonValueKind.String)
+            severity = sev.GetString();
         return new ExtraUsage(
             el.GetProperty("is_enabled").GetBoolean(),
             el.GetProperty("monthly_limit").GetDecimal() / 100m,   // API reports cents
             el.GetProperty("used_credits").GetDecimal() / 100m,    // API reports cents
             utilEl.ValueKind == JsonValueKind.Null ? null : utilEl.GetDouble(),
-            el.GetProperty("currency").GetString() ?? "");
+            el.GetProperty("currency").GetString() ?? "",
+            severity);
     }
 }
