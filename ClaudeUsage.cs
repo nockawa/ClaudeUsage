@@ -1214,11 +1214,11 @@ record UsageSnapshot(
 
     static WindowStats? ParseWindow(JsonElement root, string name, string? severity)
     {
-        if (!root.TryGetProperty(name, out var el) || el.ValueKind == JsonValueKind.Null) return null;
-        var util = el.GetProperty("utilization").GetDouble();
-        var resetsProp = el.GetProperty("resets_at");
-        if (resetsProp.ValueKind == JsonValueKind.Null) return null;
-        return new WindowStats(util, DateTimeOffset.Parse(resetsProp.GetString()!, CultureInfo.InvariantCulture))
+        if (!root.TryGetProperty(name, out var el) || el.ValueKind != JsonValueKind.Object) return null;
+        // Enterprise/Team accounts can return the window object with null numeric fields.
+        if (!el.TryGetProperty("utilization", out var utilEl) || utilEl.ValueKind != JsonValueKind.Number) return null;
+        if (!el.TryGetProperty("resets_at", out var resetsProp) || resetsProp.ValueKind != JsonValueKind.String) return null;
+        return new WindowStats(utilEl.GetDouble(), DateTimeOffset.Parse(resetsProp.GetString()!, CultureInfo.InvariantCulture))
             { Severity = severity };
     }
 
@@ -1289,19 +1289,22 @@ record UsageSnapshot(
 
     static ExtraUsage? ParseExtra(JsonElement root)
     {
-        if (!root.TryGetProperty("extra_usage", out var el) || el.ValueKind == JsonValueKind.Null) return null;
-        var utilEl = el.GetProperty("utilization");
+        if (!root.TryGetProperty("extra_usage", out var el) || el.ValueKind != JsonValueKind.Object) return null;
         // Overage severity is reported on the sibling `spend` object, not `extra_usage`.
         string? severity = null;
         if (root.TryGetProperty("spend", out var spend) && spend.ValueKind == JsonValueKind.Object
             && spend.TryGetProperty("severity", out var sev) && sev.ValueKind == JsonValueKind.String)
             severity = sev.GetString();
         return new ExtraUsage(
-            el.GetProperty("is_enabled").GetBoolean(),
-            el.GetProperty("monthly_limit").GetDecimal() / 100m,   // API reports cents
-            el.GetProperty("used_credits").GetDecimal() / 100m,    // API reports cents
-            utilEl.ValueKind == JsonValueKind.Null ? null : utilEl.GetDouble(),
-            el.GetProperty("currency").GetString() ?? "",
+            el.TryGetProperty("is_enabled", out var en) && en.ValueKind == JsonValueKind.True,
+            Cents(el, "monthly_limit"),   // API reports cents
+            Cents(el, "used_credits"),    // API reports cents
+            el.TryGetProperty("utilization", out var utilEl) && utilEl.ValueKind == JsonValueKind.Number
+                ? utilEl.GetDouble() : null,
+            el.TryGetProperty("currency", out var cur) && cur.ValueKind == JsonValueKind.String ? cur.GetString()! : "",
             severity);
+
+        static decimal Cents(JsonElement obj, string prop)
+            => obj.TryGetProperty(prop, out var p) && p.ValueKind == JsonValueKind.Number ? p.GetDecimal() / 100m : 0m;
     }
 }
