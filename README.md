@@ -4,7 +4,8 @@ A terminal dashboard for your **Claude** subscription read-time usage and servic
 
 It reads the OAuth token that `claude login` already stored on your machine, polls Anthropic's usage
 endpoint, and paints a live TUI with your session/weekly windows, per-model
-breakdown, extra-usage spend, burn-rate pace, and current Claude service status.
+breakdown, extra-usage spend, burn-rate pace, and current **Claude and GitHub**
+service status.
 
 ```sh
 dotnet tool install --global ClaudeUsage
@@ -123,6 +124,11 @@ dotnet run ClaudeUsage.cs -- --once
   instantly on startup and survive transient network/API failures with backoff.
 - **Trends** — a small local history is kept to show short-term deltas and
   burn-rate pace against your window limits.
+- **Service status** — the Claude and GitHub status pages (both Statuspage-hosted,
+  same schema) are polled every 5 minutes without auth. All green collapses to a
+  single line; the moment either reports trouble it opens into a panel with one
+  row per service — degraded components, the active incident, and any scheduled
+  maintenance window.
 
 ### Local state
 
@@ -135,9 +141,9 @@ application-data directory (`ClaudeUsage\cache.json` and `history.json`):
 
 ## Privacy
 
-This tool talks only to `api.anthropic.com` (usage/profile) and
-`status.claude.com` (service status). It does not transmit your token or usage
-data to any third party. Your credentials never leave your machine except as the
+This tool talks only to `api.anthropic.com` (usage/profile), `status.claude.com`
+and `www.githubstatus.com` (service status — public pages, no credentials sent).
+It does not transmit your token or usage data to any third party. Your credentials never leave your machine except as the
 `Authorization` header to Anthropic's own API.
 
 ## Disclaimer

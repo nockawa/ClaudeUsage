@@ -78,13 +78,21 @@ DateTimeOffset? serverRetryHint = null;
 int failures = 0;
 var history = LoadHistory();
 
-// Status client: public endpoint, no auth headers, separate pool.
+// Status client: public endpoints, no auth headers, separate pool.
 var statusClient = new HttpClient(new System.Net.Http.SocketsHttpHandler
 {
     PooledConnectionLifetime    = TimeSpan.FromMinutes(5),
     ConnectTimeout              = TimeSpan.FromSeconds(10),
 }) { Timeout = TimeSpan.FromSeconds(15) };
-var statusHolder = new StatusHolder();
+
+// Both pages are Statuspage-hosted and expose the same v2 summary schema, so a
+// single fetch/parse/render path serves them.
+var statusSources = new StatusSource[]
+{
+    new("Claude", "status.claude.com", "https://status.claude.com/api/v2/summary.json"),
+    new("GitHub", "githubstatus.com",  "https://www.githubstatus.com/api/v2/summary.json"),
+};
+var statusHolder = new StatusHolder(statusSources);
 
 if (dump)
 {
@@ -170,9 +178,9 @@ if (once)
     }
 
     var profile = await TryFetchJson("https://api.anthropic.com/api/oauth/profile", ProfileInfo.From);
-    var claudeStatus = await TryFetchStatus(statusClient);
+    var statusSlots = await FetchAllStatuses(statusClient, statusHolder.Current);
     var vm = new ViewModel(snap, profile, rateLimit, nextAttemptAt, failures, ComputeTrends(history, snap, now));
-    AnsiConsole.Write(BuildView(vm, claudeStatus, now, refreshInterval, liveMode: false));
+    AnsiConsole.Write(BuildView(vm, statusSlots, now, refreshInterval, liveMode: false));
     return snap.Error is null ? 0 : 1;
 }
 
@@ -257,7 +265,7 @@ async Task FetchLoop()
     }
 }
 
-// Status fetcher: polls status.claude.com every 5 min, best-effort, no auth.
+// Status fetcher: polls every status page every 5 min, best-effort, no auth.
 // Uses page.updated_at as a change sentinel to skip unnecessary re-parses.
 async Task StatusFetchLoop()
 {
@@ -273,13 +281,7 @@ async Task StatusFetchLoop()
             catch (OperationCanceledException) { break; }
         }
         if (ct.IsCancellationRequested) break;
-        var s = await TryFetchStatus(statusClient);
-        if (s is not null)
-        {
-            var cur = statusHolder.Current;
-            if (cur is null || s.PageUpdatedAt != cur.PageUpdatedAt)
-                statusHolder.Set(s);
-        }
+        statusHolder.Set(await FetchAllStatuses(statusClient, statusHolder.Current));
         next = DateTimeOffset.UtcNow + interval;
     }
 }
@@ -659,11 +661,24 @@ async Task<T?> TryFetchJson<T>(string url, Func<JsonElement, T> parse) where T :
     catch { return null; }
 }
 
-static async Task<ClaudeStatus?> TryFetchStatus(HttpClient httpClient)
+// Polls every page in parallel. A page that fails (or hasn't changed since the last
+// poll) keeps its previous reading, so one flaky endpoint never blanks the others.
+static async Task<StatusSlot[]> FetchAllStatuses(HttpClient httpClient, StatusSlot[] prev)
+{
+    var fetched = await Task.WhenAll(prev.Select(p => TryFetchStatus(httpClient, p.Source)));
+    var next = new StatusSlot[prev.Length];
+    for (int i = 0; i < prev.Length; i++)
+        next[i] = fetched[i] is { } s && s.PageUpdatedAt != prev[i].Status?.PageUpdatedAt
+            ? prev[i] with { Status = s }
+            : prev[i];
+    return next;
+}
+
+static async Task<ServiceStatus?> TryFetchStatus(HttpClient httpClient, StatusSource source)
 {
     try
     {
-        using var resp = await httpClient.GetAsync("https://status.claude.com/api/v2/summary.json");
+        using var resp = await httpClient.GetAsync(source.Url);
         if (!resp.IsSuccessStatusCode) return null;
         using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
         return ParseStatus(doc.RootElement);
@@ -671,14 +686,17 @@ static async Task<ClaudeStatus?> TryFetchStatus(HttpClient httpClient)
     catch { return null; }
 }
 
-static ClaudeStatus ParseStatus(JsonElement root)
+static ServiceStatus ParseStatus(JsonElement root)
 {
     var statusEl    = root.GetProperty("status");
     var indicator   = statusEl.GetProperty("indicator").GetString()!;
-    var description = statusEl.GetProperty("description").GetString()!;
+    var description = statusEl.GetProperty("description").GetString() ?? "";
 
+    // Skip group headers and components the page itself hides (GitHub carries a
+    // "Visit www.githubstatus.com…" pseudo-component that isn't a real service).
     var components = root.GetProperty("components").EnumerateArray()
-        .Where(c => !c.GetProperty("group").GetBoolean())
+        .Where(c => !(c.TryGetProperty("group", out var g) && g.GetBoolean()))
+        .Where(c => !(c.TryGetProperty("showcase", out var s) && s.ValueKind == JsonValueKind.False))
         .Select(c => new StatusComponent(
             c.GetProperty("name").GetString()!,
             c.GetProperty("status").GetString()!))
@@ -728,14 +746,14 @@ static ClaudeStatus ParseStatus(JsonElement root)
         root.GetProperty("page").GetProperty("updated_at").GetString()!,
         CultureInfo.InvariantCulture);
 
-    return new ClaudeStatus(indicator, description, components, incident, maintenance, pageUpdatedAt, DateTimeOffset.UtcNow);
+    return new ServiceStatus(indicator, description, components, incident, maintenance, pageUpdatedAt, DateTimeOffset.UtcNow);
 
     static DateTimeOffset? ParseDto(JsonElement el, string prop) =>
         el.TryGetProperty(prop, out var p) && p.ValueKind == JsonValueKind.String
             ? DateTimeOffset.Parse(p.GetString()!, CultureInfo.InvariantCulture) : null;
 }
 
-static IRenderable BuildView(ViewModel vm, ClaudeStatus? claudeStatus, DateTimeOffset now, TimeSpan refreshInterval, bool liveMode)
+static IRenderable BuildView(ViewModel vm, StatusSlot[] statusSlots, DateTimeOffset now, TimeSpan refreshInterval, bool liveMode)
 {
     var snap          = vm.Snap;
     var profile       = vm.Profile;
@@ -762,7 +780,7 @@ static IRenderable BuildView(ViewModel vm, ClaudeStatus? claudeStatus, DateTimeO
 
     var body = new Columns(leftCol, rightCol).Collapse();
 
-    var statusRow = BuildStatusRow(claudeStatus, now);
+    var statusRow = BuildStatusRow(statusSlots, now);
 
     string rlSuffix = "";
     if (rateLimit is not null && (rateLimit.Remaining is not null || rateLimit.Limit is not null))
@@ -799,28 +817,53 @@ static IRenderable BuildView(ViewModel vm, ClaudeStatus? claudeStatus, DateTimeO
     return new Rows(header, body, statusRow, footer);
 }
 
-static IRenderable BuildStatusRow(ClaudeStatus? status, DateTimeOffset now)
+// One compact line while every page reports green (the common case), a bordered
+// panel with one line per service as soon as any of them reports trouble.
+static IRenderable BuildStatusRow(StatusSlot[] slots, DateTimeOffset now)
 {
-    if (status is null)
-        return new Markup("[grey]  ○ status.claude.com …[/]");
+    var troubled = slots.Where(s => s.Status is { } st && st.Indicator != "none").ToArray();
 
-    var maint = FormatMaintenance(status.NextMaintenance, now);
-
-    if (status.Indicator == "none")
-        return new Markup("[green]  ● All systems operational[/]  [grey]status.claude.com[/]" + maint);
-
-    var (color, dot) = status.Indicator switch
+    if (troubled.Length == 0)
     {
-        "minor"    => ("yellow",   "●"),
-        "major"    => ("red",      "●"),
-        "critical" => ("bold red", "●"),
-        _          => ("grey",     "○"),
-    };
+        var known   = slots.Where(s => s.Status is not null).ToArray();
+        var pending = slots.Where(s => s.Status is null).ToArray();
+        var line = new System.Text.StringBuilder("  ");
+        if (known.Length > 0)
+        {
+            var hosts = string.Join(" · ", known.Select(s => Markup.Escape(s.Source.Host)));
+            line.Append($"[green]● All systems operational[/]  [grey]{hosts}[/]");
+            foreach (var s in known)
+                line.Append(FormatMaintenance(s.Status!.NextMaintenance, now, s.Source.Label));
+        }
+        if (pending.Length > 0)
+        {
+            if (known.Length > 0) line.Append("  [grey]·[/]  ");
+            line.Append($"[grey]○ {string.Join(" · ", pending.Select(s => Markup.Escape(s.Source.Host)))} …[/]");
+        }
+        return new Markup(line.ToString());
+    }
+
+    var worst = troubled.Select(s => s.Status!.Indicator).OrderByDescending(IndicatorRank).First();
+    var (headColor, headDot) = IndicatorStyle(worst);
+
+    return new Panel(new Rows(slots.Select(s => new Markup(BuildServiceStatusLine(s, now)))))
+        .Header($" [{headColor}]{headDot}[/] [bold]Status Update[/] ", Justify.Left)
+        .Border(BoxBorder.Rounded)
+        .BorderColor(Color.Grey39)
+        .Expand();
+}
+
+static string BuildServiceStatusLine(StatusSlot slot, DateTimeOffset now)
+{
+    var name = $"[bold]{Markup.Escape(slot.Source.Label)}[/]";
+    if (slot.Status is not { } status)
+        return $"[grey]○[/] {name}  [grey]no reading[/]  [grey]{Markup.Escape(slot.Source.Host)}[/]";
+
+    var (color, dot) = IndicatorStyle(status.Indicator);
+    var sb = new System.Text.StringBuilder();
+    sb.Append($"[{color}]{dot}[/] {name}  [{color}]{Markup.Escape(status.Description)}[/]");
 
     var degraded = status.Components.Where(c => c.Status != "operational").ToArray();
-    var sb = new System.Text.StringBuilder();
-    sb.Append($"[{color}]{dot} {Markup.Escape(status.Description)}[/]");
-
     if (degraded.Length > 0)
     {
         sb.Append($"  [grey]·[/]  ");
@@ -843,16 +886,31 @@ static IRenderable BuildStatusRow(ClaudeStatus? status, DateTimeOffset now)
         sb.Append($"  [grey]·[/]  [bold]{Markup.Escape(inc.Name)}[/] [{color}]{inc.IncidentStatus}[/] [grey]{elapsed} ago[/]");
     }
 
-    sb.Append(maint);
-
-    return new Panel(new Markup(sb.ToString()))
-        .Header($" [{color}]{dot}[/] [bold]Status Update[/] ", Justify.Left)
-        .Border(BoxBorder.Rounded)
-        .BorderColor(Color.Grey39)
-        .Expand();
+    sb.Append(FormatMaintenance(status.NextMaintenance, now));
+    return sb.ToString();
 }
 
-static string FormatMaintenance(StatusMaintenance? m, DateTimeOffset now)
+static (string Color, string Dot) IndicatorStyle(string indicator) => indicator switch
+{
+    "none"     => ("green",    "●"),
+    "minor"    => ("yellow",   "●"),
+    "major"    => ("red",      "●"),
+    "critical" => ("bold red", "●"),
+    _          => ("grey",     "○"),
+};
+
+static int IndicatorRank(string indicator) => indicator switch
+{
+    "critical" => 3,
+    "major"    => 2,
+    "minor"    => 1,
+    "none"     => 0,
+    _          => -1,
+};
+
+// `label` names the service; passed only on the collapsed all-green line, where the
+// per-service line that would otherwise carry the name isn't rendered.
+static string FormatMaintenance(StatusMaintenance? m, DateTimeOffset now, string? label = null)
 {
     if (m is null) return "";
     string when;
@@ -862,7 +920,8 @@ static string FormatMaintenance(StatusMaintenance? m, DateTimeOffset now)
         when = f > now ? $"in {FormatDuration(f - now)}" : "imminent";
     else
         when = Markup.Escape(m.Status);
-    return $"  [grey]·[/]  [blue]🔧 {Markup.Escape(m.Name)}[/] [grey]{when}[/]";
+    var prefix = label is null ? "" : $"{Markup.Escape(label)}: ";
+    return $"  [grey]·[/]  [blue]🔧 {prefix}{Markup.Escape(m.Name)}[/] [grey]{when}[/]";
 }
 
 static Panel BuildWindowPanel(string title, WindowStats? w, TimeSpan windowDuration, DateTimeOffset now, bool showPace, Trend? trend)
@@ -1119,7 +1178,14 @@ record ModelUsage(string Model, double? Percent, DateTimeOffset? ResetsAt, bool 
 
 record ExtraUsage(bool Enabled, decimal MonthlyLimit, decimal UsedCredits, double? Utilization, string Currency, string? Severity);
 
-record ClaudeStatus(
+// A Statuspage-hosted status page: `Label` is what the UI calls the service, `Host`
+// is shown as the attribution, `Url` is the v2 summary endpoint.
+record StatusSource(string Label, string Host, string Url);
+
+// A service and its latest reading — null until the first successful poll.
+record StatusSlot(StatusSource Source, ServiceStatus? Status);
+
+record ServiceStatus(
     string Indicator,
     string Description,
     StatusComponent[] Components,
@@ -1177,11 +1243,15 @@ sealed class ModelHolder
     public void Set(ViewModel vm) => Volatile.Write(ref _vm, vm);
 }
 
+// Same one-slot mailbox pattern as ModelHolder: the status fetcher swaps in a whole
+// new array, so the renderer never sees a half-updated set of services.
 sealed class StatusHolder
 {
-    ClaudeStatus? _s;
-    public ClaudeStatus? Current => Volatile.Read(ref _s);
-    public void Set(ClaudeStatus s) => Volatile.Write(ref _s, s);
+    StatusSlot[] _s;
+    public StatusHolder(IEnumerable<StatusSource> sources) =>
+        _s = sources.Select(s => new StatusSlot(s, null)).ToArray();
+    public StatusSlot[] Current => Volatile.Read(ref _s);
+    public void Set(StatusSlot[] slots) => Volatile.Write(ref _s, slots);
 }
 
 record Trend(double ObservedRatePctPerHour, double TargetRatePctPerHour, int Bucket)
