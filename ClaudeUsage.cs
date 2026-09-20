@@ -569,7 +569,12 @@ static void AppendHistory(HistoryStore s, string key, WindowStats? w, DateTimeOf
     // shifts resets_at by the full window length (5h or 7d) so this is unambiguous.
     list.RemoveAll(x => !SameWindow(x.ResetsAt, w.ResetsAt));
     list.Add(new HistorySample { At = at, Util = w.UtilPct, ResetsAt = w.ResetsAt });
-    if (list.Count > 96) list.RemoveRange(0, list.Count - 96);
+    // Retain by age, not by count: the weekly pace reads a trailing 24h, and a count cap
+    // would silently shorten that as --interval drops. Keep one extra hour of slack so a
+    // sample still brackets `now - 24h` from below instead of being pruned just past it.
+    var keepFrom = at - PaceLookback() - TimeSpan.FromHours(1);
+    list.RemoveAll(x => x.At < keepFrom);
+    if (list.Count > 4096) list.RemoveRange(0, list.Count - 4096); // pathologically small intervals
 }
 
 static bool SameWindow(DateTimeOffset a, DateTimeOffset b) =>
@@ -587,7 +592,33 @@ static TrendSet ComputeTrends(HistoryStore s, UsageSnapshot snap, DateTimeOffset
     return new TrendSet(
         ComputeTrend(s, "session", snap.Session, now, TimeSpan.FromMinutes(45)),
         ComputeTrend(s, "weekly",  snap.Weekly,  now, TimeSpan.FromHours(3)),
+        ComputePace(s, "weekly", snap.Weekly, now),
         models);
+}
+
+static TimeSpan PaceLookback() => TimeSpan.FromHours(24);
+
+// Recent burn rate for the weekly window: %/day over the trailing 24h rather than averaged
+// since the window opened, so a quiet Monday stops masking a heavy Friday. Needs at least
+// an hour of samples to be worth showing, since a shorter span multiplies sampling noise by
+// 24. Returns null when history is too thin — the panel then falls back to the average.
+static Pace? ComputePace(HistoryStore s, string key, WindowStats? w, DateTimeOffset now)
+{
+    if (w is null) return null;
+    if (!s.Series.TryGetValue(key, out var list)) return null;
+    var current = list.Where(x => SameWindow(x.ResetsAt, w.ResetsAt)).ToList();
+    if (current.Count < 2) return null;
+
+    // Bracket the cutoff from below: the last sample at or before `now - 24h`, so a reading
+    // a few minutes too old is used rather than discarded. Retention bounds how far back
+    // that can reach, so the measured span stays within an interval of 24h.
+    var cutoff   = now - PaceLookback();
+    var earliest = current.LastOrDefault(x => x.At <= cutoff) ?? current[0];
+    var latest   = current[^1];
+    var hours    = (latest.At - earliest.At).TotalHours;
+    if (hours < 1.0) return null;
+
+    return new Pace(Math.Max(0, (latest.Util - earliest.Util) / hours * 24), hours);
 }
 
 static Trend? ComputeTrend(HistoryStore s, string key, WindowStats? w, DateTimeOffset now, TimeSpan lookback)
@@ -769,12 +800,12 @@ static IRenderable BuildView(ViewModel vm, StatusSlot[] statusSlots, DateTimeOff
     var header = new Rule(string.Join("  ·  ", parts)) { Justification = Justify.Left };
 
     var leftCol = new Rows(
-        BuildWindowPanel("🕐 Session (5h)", snap.Session, TimeSpan.FromHours(5), now, showPace: false, trends.Session),
+        BuildWindowPanel("🕐 Session (5h)", snap.Session, TimeSpan.FromHours(5), now, showPace: false, pace: null, trends.Session),
         BuildModelPanel(snap, trends)
     );
 
     var rightCol = new Rows(
-        BuildWindowPanel("📅 Weekly (7d)", snap.Weekly, TimeSpan.FromDays(7), now, showPace: true, trends.Weekly),
+        BuildWindowPanel("📅 Weekly (7d)", snap.Weekly, TimeSpan.FromDays(7), now, showPace: true, trends.WeeklyPace, trends.Weekly),
         BuildExtraPanel(snap.Extra)
     );
 
@@ -924,7 +955,7 @@ static string FormatMaintenance(StatusMaintenance? m, DateTimeOffset now, string
     return $"  [grey]·[/]  [blue]🔧 {prefix}{Markup.Escape(m.Name)}[/] [grey]{when}[/]";
 }
 
-static Panel BuildWindowPanel(string title, WindowStats? w, TimeSpan windowDuration, DateTimeOffset now, bool showPace, Trend? trend)
+static Panel BuildWindowPanel(string title, WindowStats? w, TimeSpan windowDuration, DateTimeOffset now, bool showPace, Pace? pace, Trend? trend)
 {
     if (w is null)
         return Wrap(title, new Markup("[grey]no data[/]"));
@@ -953,10 +984,14 @@ static Panel BuildWindowPanel(string title, WindowStats? w, TimeSpan windowDurat
         var remaining = 100 - w.UtilPct;
         var daysLeft = Math.Max((w.ResetsAt - now).TotalDays, 0);
         var target  = daysLeft > 0 ? remaining / daysLeft : 0;
-        var current = elapsed.TotalDays > 0 ? w.UtilPct / elapsed.TotalDays : 0;
+        // Recent burn beats the since-window-open average for deciding whether to ease off
+        // today. The basis tag distinguishes the two, and names the span when it's short.
+        var (current, basis) = pace is { } p
+            ? (p.PctPerDay, p.HoursObserved >= 23.5 ? "24h" : $"{p.HoursObserved:F0}h")
+            : (elapsed.TotalDays > 0 ? w.UtilPct / elapsed.TotalDays : 0, "avg");
         var paceColor = current > target ? "red" : "green";
         grid.AddEmptyRow();
-        grid.AddRow("Pace",   $"[{paceColor}]{current:F1}%/d[/]");
+        grid.AddRow("Pace",   $"[{paceColor}]{current:F1}%/d[/]  [grey]({basis})[/]");
         grid.AddRow("Target", $"{target:F1}%/d");
     }
 
@@ -1222,7 +1257,11 @@ class HistorySample
     public DateTimeOffset ResetsAt { get; set; }
 }
 
-record TrendSet(Trend? Session, Trend? Weekly, IReadOnlyDictionary<string, Trend?> Models);
+record TrendSet(Trend? Session, Trend? Weekly, Pace? WeeklyPace, IReadOnlyDictionary<string, Trend?> Models);
+
+// Burn rate over a trailing window, in %/day. HoursObserved is the real history behind it:
+// below 24h the panel says so rather than passing a 3h reading off as a day's worth.
+record Pace(double PctPerDay, double HoursObserved);
 
 // Immutable snapshot of everything the view needs. The fetcher builds a new one per
 // attempt and swaps it into ModelHolder; the renderer always sees a consistent set.
