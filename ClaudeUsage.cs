@@ -10,6 +10,7 @@
 #:property RepositoryUrl=https://github.com/nockawa/ClaudeUsage.git
 #:property RepositoryType=git
 #:property PackageLicenseExpression=Unlicense
+#:property PackageReadmeFile=README.md
 #:property PublishAot=false
 #:package Spectre.Console@0.57.0
 

@@ -1,0 +1,11 @@
+<Project>
+
+  <!-- File-based apps (`dotnet run ClaudeUsage.cs`) configure packaging through the
+       `#:property` directives in the .cs header, but those set properties only — they
+       can't declare items. PackageReadmeFile needs the file itself packed, so the item
+       lives here, in the props the generated project imports from this directory. -->
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>

@@ -18,7 +18,7 @@ tool. Under the hood it's still a **.NET file-based app** — a single
 so you can also run it straight from source with no build step and no `.csproj`,
 see [Run from source](#run-from-source) below.
 
-![Claude Usage Monitor dashboard](screenshot.png)
+![Claude Usage Monitor dashboard](https://raw.githubusercontent.com/nockawa/ClaudeUsage/main/screenshot.png)
 
 ## Requirements
 
@@ -153,5 +153,5 @@ trademark of Anthropic. Use at your own risk.
 
 ## License
 
-Released into the public domain under [The Unlicense](LICENSE) — do whatever you
+Released into the public domain under [The Unlicense](https://github.com/nockawa/ClaudeUsage/blob/main/LICENSE) — do whatever you
 want with it.
