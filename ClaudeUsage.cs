@@ -4,7 +4,7 @@
 #:property ToolCommandName=claude-usage
 #:property PackageId=ClaudeUsage
 #:property Authors=nockawa
-#:property Description=Terminal dashboard for your Claude subscription usage — session/weekly windows, per-model burn-rate pace, extra-usage spend, and live service status.
+#:property Description=Terminal dashboard for your Claude subscription usage — session/weekly windows, per-model burn-rate pace, extra-usage spend, live service status, and Claude release news.
 #:property PackageTags=claude;anthropic;usage;cli;tui;dashboard;dotnet-tool;spectre-console
 #:property PackageProjectUrl=https://github.com/nockawa/ClaudeUsage
 #:property RepositoryUrl=https://github.com/nockawa/ClaudeUsage.git
@@ -95,6 +95,11 @@ var statusSources = new StatusSource[]
 };
 var statusHolder = new StatusHolder(statusSources);
 
+// News: announcements a developer shouldn't miss, polled every 30 min on the same
+// no-auth client. Seen/acknowledged state persists so a restart neither replays old
+// entries nor forgets unacknowledged ones.
+var news = new NewsState(NewsPath());
+
 if (dump)
 {
     // Resolve org uuid from profile so we can probe org-scoped endpoints.
@@ -179,9 +184,11 @@ if (once)
     }
 
     var profile = await TryFetchJson("https://api.anthropic.com/api/oauth/profile", ProfileInfo.From);
-    var statusSlots = await FetchAllStatuses(statusClient, statusHolder.Current);
+    var statusTask = FetchAllStatuses(statusClient, statusHolder.Current);
+    await FetchNews(statusClient, news);
+    var statusSlots = await statusTask;
     var vm = new ViewModel(snap, profile, rateLimit, nextAttemptAt, failures, ComputeTrends(history, snap, now));
-    AnsiConsole.Write(BuildView(vm, statusSlots, now, refreshInterval, liveMode: false));
+    AnsiConsole.Write(BuildView(vm, statusSlots, news.Current, now, refreshInterval, liveMode: false));
     return snap.Error is null ? 0 : 1;
 }
 
@@ -203,8 +210,10 @@ var model = new ModelHolder();
 var quitCts = new CancellationTokenSource();
 var refreshSignal = new SemaphoreSlim(0, 1);
 var statusRefreshSignal = new SemaphoreSlim(0, 1);
+var newsRefreshSignal = new SemaphoreSlim(0, 1);
 
-// Blocking key reads live on their own thread: 'r' nudges the fetcher, 'q' quits.
+// Blocking key reads live on their own thread: 'r' nudges the fetchers, 'a' acknowledges
+// news, 'q' quits.
 var keyThread = new Thread(() =>
 {
     while (!quitCts.IsCancellationRequested)
@@ -216,7 +225,9 @@ var keyThread = new Thread(() =>
             {
                 if (refreshSignal.CurrentCount == 0) refreshSignal.Release();
                 if (statusRefreshSignal.CurrentCount == 0) statusRefreshSignal.Release();
+                if (newsRefreshSignal.CurrentCount == 0) newsRefreshSignal.Release();
             }
+            else if (k.Key == ConsoleKey.A) news.Acknowledge();
             else if (k.Key == ConsoleKey.Q) { quitCts.Cancel(); break; }
         }
         catch { Thread.Sleep(100); }
@@ -287,24 +298,39 @@ async Task StatusFetchLoop()
     }
 }
 
+// News fetcher: every 30 min. Announcements aren't time-critical to the minute, and
+// the release notes page is ~110 KB with no validators, so polling faster buys nothing.
+async Task NewsFetchLoop()
+{
+    var ct = quitCts.Token;
+    var interval = TimeSpan.FromMinutes(30);
+    while (!ct.IsCancellationRequested)
+    {
+        await FetchNews(statusClient, news);
+        try { await newsRefreshSignal.WaitAsync(interval, ct); }
+        catch (OperationCanceledException) { break; }
+    }
+}
+
 var fetcher       = Task.Run(FetchLoop);
 var statusFetcher = Task.Run(StatusFetchLoop);
+var newsFetcher   = Task.Run(NewsFetchLoop);
 
-await AnsiConsole.Live(BuildView(model.Current, statusHolder.Current, DateTimeOffset.UtcNow, refreshInterval, liveMode: true))
+await AnsiConsole.Live(BuildView(model.Current, statusHolder.Current, news.Current, DateTimeOffset.UtcNow, refreshInterval, liveMode: true))
     .AutoClear(false)
     .Overflow(VerticalOverflow.Ellipsis)
     .StartAsync(async ctx =>
     {
         while (!quitCts.IsCancellationRequested)
         {
-            ctx.UpdateTarget(BuildView(model.Current, statusHolder.Current, DateTimeOffset.UtcNow, refreshInterval, liveMode: true));
+            ctx.UpdateTarget(BuildView(model.Current, statusHolder.Current, news.Current, DateTimeOffset.UtcNow, refreshInterval, liveMode: true));
             try { await Task.Delay(1000, quitCts.Token); }
             catch (OperationCanceledException) { break; }
         }
     });
 
 quitCts.Cancel();
-await Task.WhenAny(fetcher, statusFetcher, Task.Delay(500)); // let tasks unwind, but never hang quit
+await Task.WhenAny(Task.WhenAll(fetcher, statusFetcher, newsFetcher), Task.Delay(500)); // let tasks unwind, but never hang quit
 return 0;
 
 async Task<UsageSnapshot> FetchOnce()
@@ -785,7 +811,119 @@ static ServiceStatus ParseStatus(JsonElement root)
             ? DateTimeOffset.Parse(p.GetString()!, CultureInfo.InvariantCulture) : null;
 }
 
-static IRenderable BuildView(ViewModel vm, StatusSlot[] statusSlots, DateTimeOffset now, TimeSpan refreshInterval, bool liveMode)
+static string NewsPath() => Path.Combine(
+    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+    "ClaudeUsage", "news.json");
+
+// All three sources in parallel. A source that fails keeps its previous items, so a
+// flaky endpoint never resurrects or drops entries.
+static async Task FetchNews(HttpClient httpClient, NewsState news)
+{
+    var notes   = TryFetchText(httpClient, NewsUrls.ReleaseNotes + ".md");
+    var digest  = TryFetchText(httpClient, NewsUrls.WhatsNew + "/index.md");
+    var npm     = TryFetchText(httpClient, NewsUrls.NpmLatest);
+    await Task.WhenAll(notes, digest, npm);
+
+    if (await notes  is { } n) news.Apply("platform",  ParseReleaseNotes(n));
+    if (await digest is { } d) news.Apply("whats-new", ParseWhatsNew(d));
+    if (await npm    is { } j)
+        try
+        {
+            using var doc = JsonDocument.Parse(j);
+            news.SetCliVersion(doc.RootElement.GetProperty("version").GetString());
+        }
+        catch { }
+}
+
+static async Task<string?> TryFetchText(HttpClient httpClient, string url)
+{
+    try
+    {
+        using var resp = await httpClient.GetAsync(url);
+        return resp.IsSuccessStatusCode ? await resp.Content.ReadAsStringAsync() : null;
+    }
+    catch { return null; }
+}
+
+// Platform release notes: `### <Month d, yyyy>` headings, each followed by top-level
+// bullets (`* ` or `- `). One item per bullet; only the most recent dates are kept,
+// which bounds both the seen-set and the work on a page that grows forever.
+static List<NewsItem> ParseReleaseNotes(string md)
+{
+    const int maxDates = 8;
+    var items = new List<NewsItem>();
+    DateTimeOffset? date = null;
+    var dates = 0;
+    foreach (var raw in md.Split('\n'))
+    {
+        var line = raw.TrimEnd('\r');
+        if (line.StartsWith("### "))
+        {
+            if (++dates > maxDates) break;
+            date = DateTimeOffset.TryParseExact(line[4..].Trim(), "MMMM d, yyyy", CultureInfo.InvariantCulture,
+                                                DateTimeStyles.AssumeUniversal, out var d) ? d : null;
+            continue;
+        }
+        if (date is not { } when || !(line.StartsWith("* ") || line.StartsWith("- "))) continue;
+        var text = CleanMarkdown(line[2..]);
+        // Keyed on the date plus the head of the text: stable across a later wording
+        // tweak at the tail, distinct for two bullets on the same day.
+        var key = $"platform:{when:yyyy-MM-dd}:{(text.Length > 60 ? text[..60] : text)}";
+        items.Add(new NewsItem(key, "Platform", when, $"{when:MMM d}", FirstSentence(text), NewsUrls.ReleaseNotes));
+    }
+    return items;
+}
+
+// Claude Code "What's new": one `<Update label="Week N" description="<dates>">` block per
+// week; its first paragraph is the headline feature, the rest ("Also this week") is skipped.
+static List<NewsItem> ParseWhatsNew(string md)
+{
+    var items = new List<NewsItem>();
+    var rx = new System.Text.RegularExpressions.Regex(
+        "<Update label=\"([^\"]+)\" description=\"([^\"]+)\"[^>]*>(.*?)</Update>",
+        System.Text.RegularExpressions.RegexOptions.Singleline);
+    var i = 0;
+    foreach (System.Text.RegularExpressions.Match m in rx.Matches(md))
+    {
+        if (i++ >= 8) break; // newest first
+        var (label, range, body) = (m.Groups[1].Value, m.Groups[2].Value, m.Groups[3].Value);
+        var headline = body.Split('\n').Select(l => l.Trim()).FirstOrDefault(l => l.Length > 0) ?? "";
+        var link = System.Text.RegularExpressions.Regex.Match(body, @"\]\((/docs/en/whats-new/[^)\s]+)\)");
+        var url  = link.Success ? "https://code.claude.com" + link.Groups[1].Value : NewsUrls.WhatsNew;
+        items.Add(new NewsItem($"whats-new:{label}|{range}", "Claude Code", WeekStart(range), label,
+                               FirstSentence(CleanMarkdown(headline)), url));
+    }
+    return items;
+}
+
+// "September 7–11, 2026" / "August 31 – September 4, 2026": start month and day, with the
+// year the range ends in. A range spanning New Year would land a year ahead; pull it back.
+static DateTimeOffset WeekStart(string range)
+{
+    var m = System.Text.RegularExpressions.Regex.Match(range, @"^([A-Za-z]+) (\d{1,2}).*(\d{4})\s*$");
+    if (!m.Success || !DateTimeOffset.TryParseExact($"{m.Groups[1].Value} {m.Groups[2].Value}, {m.Groups[3].Value}",
+            "MMMM d, yyyy", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var d))
+        return DateTimeOffset.MinValue;
+    return d > DateTimeOffset.UtcNow.AddDays(1) ? d.AddYears(-1) : d;
+}
+
+// Links → their text, emphasis and code ticks dropped, MDX escapes undone.
+static string CleanMarkdown(string s)
+{
+    s = System.Text.RegularExpressions.Regex.Replace(s, @"\[([^\]]+)\]\([^)]*\)", "$1");
+    s = s.Replace("**", "").Replace("`", "").Replace("\\$", "$");
+    return System.Text.RegularExpressions.Regex.Replace(s, @"\s+", " ").Trim();
+}
+
+static string FirstSentence(string s)
+{
+    const int max = 160;
+    var dot = s.IndexOf(". ", 20, StringComparison.Ordinal);
+    if (dot > 0 && dot < max) return s[..(dot + 1)];
+    return s.Length > max ? s[..(max - 1)].TrimEnd() + "…" : s;
+}
+
+static IRenderable BuildView(ViewModel vm, StatusSlot[] statusSlots, NewsView news, DateTimeOffset now, TimeSpan refreshInterval, bool liveMode)
 {
     var snap          = vm.Snap;
     var profile       = vm.Profile;
@@ -813,6 +951,9 @@ static IRenderable BuildView(ViewModel vm, StatusSlot[] statusSlots, DateTimeOff
     var body = new Columns(leftCol, rightCol).Collapse();
 
     var statusRow = BuildStatusRow(statusSlots, now);
+    // Blink by alternating styles on the 1 s render tick: SGR blink is ignored by
+    // several terminals, this works everywhere. --once prints a steady frame.
+    var newsRow = BuildNewsRow(news, blinkOn: liveMode && now.Second % 2 == 0, liveMode);
 
     string rlSuffix = "";
     if (rateLimit is not null && (rateLimit.Remaining is not null || rateLimit.Limit is not null))
@@ -843,10 +984,41 @@ static IRenderable BuildView(ViewModel vm, StatusSlot[] statusSlots, DateTimeOff
     {
         var nextFetch = nextAttemptAt - now;
         var when = nextFetch.TotalSeconds > 1 ? $"in {FormatDuration(nextFetch)}" : "now…";
-        footer = new Markup($"[grey]Next refresh {when}  ·  [bold]r[/] refresh now  ·  [bold]q[/] quit[/]{rlSuffix}");
+        var ack = news.Unseen.Count > 0 ? "  ·  [bold]a[/] acknowledge news" : "";
+        footer = new Markup($"[grey]Next refresh {when}  ·  [bold]r[/] refresh now{ack}  ·  [bold]q[/] quit[/]{rlSuffix}");
     }
 
-    return new Rows(header, body, statusRow, footer);
+    return new Rows(header, body, statusRow, newsRow, footer);
+}
+
+// One quiet line with the latest of each source while nothing is new; a blinking
+// panel listing every unacknowledged entry otherwise.
+static IRenderable BuildNewsRow(NewsView news, bool blinkOn, bool liveMode)
+{
+    if (news.Unseen.Count == 0)
+    {
+        var parts = new List<string>();
+        if (news.CliVersion is { } v) parts.Add($"Claude Code [white]v{Markup.Escape(v)}[/]");
+        if (news.Latest.TryGetValue("platform",  out var p)) parts.Add($"[link={p.Url}]Platform notes {Markup.Escape(p.When)}[/]");
+        if (news.Latest.TryGetValue("whats-new", out var w)) parts.Add($"[link={w.Url}]What's new {Markup.Escape(w.When)}[/]");
+        return new Markup(parts.Count > 0
+            ? $"  [grey]📰 {string.Join("  ·  ", parts)}[/]"
+            : "  [grey]📰 news …[/]");
+    }
+
+    const int maxRows = 8;
+    var rows = news.Unseen.Take(maxRows).Select(i => (IRenderable)new Markup(
+        $"[bold yellow]{Markup.Escape(i.Source)}[/] [grey]{Markup.Escape(i.When)}[/]  [link={i.Url}]{Markup.Escape(i.Text)}[/]")).ToList();
+    if (news.Unseen.Count > maxRows)
+        rows.Add(new Markup($"[grey]+{news.Unseen.Count - maxRows} more[/]"));
+
+    var headStyle = blinkOn ? "bold black on yellow" : "bold yellow";
+    var hint = liveMode ? "  [grey]press [bold]a[/] to acknowledge[/]" : "";
+    return new Panel(new Rows(rows))
+        .Header($" [{headStyle}] 📢 NEW ({news.Unseen.Count}) [/]{hint} ", Justify.Left)
+        .Border(BoxBorder.Rounded)
+        .BorderColor(blinkOn ? Color.Yellow : Color.Grey39)
+        .Expand();
 }
 
 // One compact line while every page reports green (the common case), a bordered
@@ -1292,6 +1464,134 @@ sealed class StatusHolder
         _s = sources.Select(s => new StatusSlot(s, null)).ToArray();
     public StatusSlot[] Current => Volatile.Read(ref _s);
     public void Set(StatusSlot[] slots) => Volatile.Write(ref _s, slots);
+}
+
+static class NewsUrls
+{
+    public const string ReleaseNotes = "https://platform.claude.com/docs/en/release-notes/overview";
+    public const string WhatsNew     = "https://code.claude.com/docs/en/whats-new";
+    public const string NpmLatest    = "https://registry.npmjs.org/@anthropic-ai/claude-code/latest";
+}
+
+// One announcement. `Key` is its stable identity in the seen-set; `Date` orders entries
+// across sources; `When` is the short label shown (a date, or "Week 37").
+record NewsItem(string Key, string Source, DateTimeOffset Date, string When, string Text, string Url);
+
+// What the renderer needs: unacknowledged entries newest first, the latest entry of each
+// source for the quiet line, and the current Claude Code version.
+record NewsView(IReadOnlyList<NewsItem> Unseen, IReadOnlyDictionary<string, NewsItem> Latest, string? CliVersion);
+
+// Owns the seen-set and its file. Writers (news fetcher, key thread) serialize on a lock
+// and republish an immutable NewsView; the renderer only reads it, like ModelHolder.
+//
+// The first successful fetch of a source only baselines it: everything already
+// published is marked seen, so a fresh install doesn't flash a year of history.
+sealed class NewsState
+{
+    const int MaxSeen = 1000;
+
+    readonly string _path;
+    readonly object _lock = new();
+    readonly HashSet<string> _baselined = new();
+    readonly List<string> _seenOrder = new();       // insertion order, for trimming
+    readonly HashSet<string> _seen = new();
+    readonly Dictionary<string, List<NewsItem>> _items = new();
+    string? _cliVersion;
+    NewsView _view = new(Array.Empty<NewsItem>(), new Dictionary<string, NewsItem>(), null);
+
+    public NewsState(string path)
+    {
+        _path = path;
+        Load();
+    }
+
+    public NewsView Current => Volatile.Read(ref _view);
+
+    public void Apply(string source, List<NewsItem> items)
+    {
+        if (items.Count == 0) return; // a parse that finds nothing means the page changed shape, not that news vanished
+        lock (_lock)
+        {
+            _items[source] = items;
+            if (_baselined.Add(source))
+            {
+                foreach (var i in items) MarkSeen(i.Key);
+                Save();
+            }
+            Publish();
+        }
+    }
+
+    public void SetCliVersion(string? version)
+    {
+        lock (_lock) { _cliVersion = version; Publish(); }
+    }
+
+    public void Acknowledge()
+    {
+        lock (_lock)
+        {
+            var unseen = _items.Values.SelectMany(l => l).Where(i => !_seen.Contains(i.Key)).ToList();
+            if (unseen.Count == 0) return;
+            foreach (var i in unseen) MarkSeen(i.Key);
+            Save();
+            Publish();
+        }
+    }
+
+    void MarkSeen(string key)
+    {
+        if (!_seen.Add(key)) return;
+        _seenOrder.Add(key);
+        if (_seenOrder.Count <= MaxSeen) return;
+        foreach (var old in _seenOrder.Take(_seenOrder.Count - MaxSeen)) _seen.Remove(old);
+        _seenOrder.RemoveRange(0, _seenOrder.Count - MaxSeen);
+    }
+
+    void Publish()
+    {
+        var unseen = _items.Values.SelectMany(l => l)
+            .Where(i => !_seen.Contains(i.Key))
+            .OrderByDescending(i => i.Date)
+            .ToList();
+        var latest = _items.Where(kv => kv.Value.Count > 0)
+            .ToDictionary(kv => kv.Key, kv => kv.Value.MaxBy(i => i.Date)!);
+        Volatile.Write(ref _view, new NewsView(unseen, latest, _cliVersion));
+    }
+
+    void Load()
+    {
+        try
+        {
+            if (!File.Exists(_path)) return;
+            using var doc = JsonDocument.Parse(File.ReadAllText(_path));
+            foreach (var b in doc.RootElement.GetProperty("baselined").EnumerateArray()) _baselined.Add(b.GetString()!);
+            foreach (var s in doc.RootElement.GetProperty("seen").EnumerateArray()) MarkSeen(s.GetString()!);
+        }
+        catch { _baselined.Clear(); _seen.Clear(); _seenOrder.Clear(); } // corrupt → re-baseline rather than replay
+    }
+
+    void Save()
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
+            using var ms = new MemoryStream();
+            using (var w = new Utf8JsonWriter(ms, new JsonWriterOptions { Indented = true }))
+            {
+                w.WriteStartObject();
+                w.WriteStartArray("baselined");
+                foreach (var b in _baselined) w.WriteStringValue(b);
+                w.WriteEndArray();
+                w.WriteStartArray("seen");
+                foreach (var s in _seenOrder) w.WriteStringValue(s);
+                w.WriteEndArray();
+                w.WriteEndObject();
+            }
+            File.WriteAllBytes(_path, ms.ToArray());
+        }
+        catch { }
+    }
 }
 
 record Trend(double ObservedRatePctPerHour, double TargetRatePctPerHour, int Bucket)

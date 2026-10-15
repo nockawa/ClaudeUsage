@@ -4,8 +4,9 @@ A terminal dashboard for your **Claude** subscription read-time usage and servic
 
 It reads the OAuth token that `claude login` already stored on your machine, polls Anthropic's usage
 endpoint, and paints a live TUI with your session/weekly windows, per-model
-breakdown, extra-usage spend, burn-rate pace, and current **Claude and GitHub**
-service status.
+breakdown, extra-usage spend, burn-rate pace, current **Claude and GitHub**
+service status, and a blinking alert when Anthropic ships a new model or a major
+Claude Code feature.
 
 ```sh
 dotnet tool install --global ClaudeUsage
@@ -82,6 +83,7 @@ dotnet run ClaudeUsage.cs -- --once
 ### Live-mode keys
 
 - `r` — refresh now
+- `a` — acknowledge news (stops the blinking)
 - `q` — quit
 
 ## How it authenticates (unofficial)
@@ -129,11 +131,20 @@ dotnet run ClaudeUsage.cs -- --once
   single line; the moment either reports trouble it opens into a panel with one
   row per service — degraded components, the active incident, and any scheduled
   maintenance window.
+- **News** — polled every 30 minutes without auth, from two curated sources: the
+  [Claude Platform release notes](https://platform.claude.com/docs/en/release-notes/overview)
+  (new models and API features, published the same day) and the Claude Code
+  [What's new](https://code.claude.com/docs/en/whats-new) weekly digest (major
+  features only; bug fixes and minor releases stay out). The latest Claude Code
+  version comes from npm and is shown but never alerted on. Anything new opens a
+  blinking panel until you press `a`. The first run only records what's already
+  published, so an install doesn't replay history.
 
 ### Local state
 
 Cache and history are stored outside the repo, in your platform's local
-application-data directory (`ClaudeUsage\cache.json` and `history.json`):
+application-data directory (`ClaudeUsage\cache.json`, `history.json`, and
+`news.json`, the acknowledged-news list):
 
 - **Windows** — `%LOCALAPPDATA%\ClaudeUsage\`
 - **macOS** — `~/Library/Application Support/ClaudeUsage/`
@@ -142,7 +153,9 @@ application-data directory (`ClaudeUsage\cache.json` and `history.json`):
 ## Privacy
 
 This tool talks only to `api.anthropic.com` (usage/profile), `status.claude.com`
-and `www.githubstatus.com` (service status — public pages, no credentials sent).
+and `www.githubstatus.com` (service status), and `platform.claude.com`,
+`code.claude.com` and `registry.npmjs.org` (news). All but the first are public
+pages; no credentials are sent to them.
 It does not transmit your token or usage data to any third party. Your credentials never leave your machine except as the
 `Authorization` header to Anthropic's own API.
 
